@@ -6,7 +6,7 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from passlib.context import CryptContext
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from psycopg.rows import dict_row
 
 DSN = os.environ.get("DATABASE_URL", "postgresql://app:app@localhost:54394/printreg")
@@ -17,6 +17,8 @@ USERS = {
     "printer": {"role": "writer", "password_hash": pwd.hash("print123456")},
     "checker": {"role": "reader", "password_hash": pwd.hash("check123456")},
 }
+
+INITIAL_TOLERANCE_MM = 0.15
 
 
 def connect():
@@ -33,7 +35,15 @@ CREATE TABLE IF NOT EXISTS jobs (
     verdict text NOT NULL DEFAULT '',
     reason text NOT NULL DEFAULT '',
     created_by text NOT NULL,
-    created_at timestamptz NOT NULL
+    created_at timestamptz NOT NULL,
+    tolerance_mm double precision
+);
+CREATE TABLE IF NOT EXISTS tolerance_revisions (
+    id serial PRIMARY KEY,
+    tolerance_mm double precision NOT NULL,
+    changed_by text NOT NULL,
+    reason text NOT NULL DEFAULT '',
+    changed_at timestamptz NOT NULL
 );
 """
 
@@ -47,6 +57,11 @@ class JobIn(BaseModel):
     sheet: str
     cyan_mm: float
     magenta_mm: float
+
+
+class ToleranceIn(BaseModel):
+    tolerance_mm: float = Field(gt=0)
+    reason: str = ""
 
 
 def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(security)) -> dict:
@@ -63,7 +78,7 @@ def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(secu
 
 def require_writer(user: dict = Depends(current_user)) -> dict:
     if user["role"] != "writer":
-        raise HTTPException(status_code=403, detail="仅印刷员可送复核")
+        raise HTTPException(status_code=403, detail="仅印刷员可操作")
     return user
 
 
@@ -74,6 +89,16 @@ app = FastAPI(title="印刷套准复核台")
 def startup():
     with connect() as conn:
         conn.execute(SCHEMA)
+        # 旧卷升级：领取瞬间记下的允差快照
+        conn.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS tolerance_mm double precision")
+        # 初始档：仅在改档表为空时插入。咨询锁串行化 api/worker 并发启动，避免重复初始档
+        conn.execute("SELECT pg_advisory_xact_lock(910273)")
+        conn.execute(
+            """INSERT INTO tolerance_revisions (tolerance_mm, changed_by, reason, changed_at)
+               SELECT %s, 'system', '初始允差档', now()
+               WHERE NOT EXISTS (SELECT 1 FROM tolerance_revisions)""",
+            (INITIAL_TOLERANCE_MM,),
+        )
         n = conn.execute("SELECT COUNT(*) AS n FROM jobs").fetchone()["n"]
         if n == 0:
             now = datetime.now(timezone.utc)
@@ -106,7 +131,9 @@ def login(body: LoginIn):
 def list_jobs(_user: dict = Depends(current_user)):
     with connect() as conn:
         return conn.execute(
-            "SELECT id, sheet, cyan_mm, magenta_mm, status, verdict, reason, created_by FROM jobs ORDER BY id DESC"
+            """SELECT id, sheet, cyan_mm, magenta_mm, status, verdict, reason,
+                      created_by, tolerance_mm
+               FROM jobs ORDER BY id DESC"""
         ).fetchall()
 
 
@@ -118,6 +145,32 @@ def enqueue(body: JobIn, user: dict = Depends(require_writer)):
                VALUES (%s, %s, %s, 'pending', %s, %s)
                RETURNING id, sheet, status, verdict""",
             (body.sheet.strip(), body.cyan_mm, body.magenta_mm, user["username"], datetime.now(timezone.utc)),
+        ).fetchone()
+        conn.commit()
+    return row
+
+
+@app.get("/api/tolerance")
+def get_tolerance(_user: dict = Depends(current_user)):
+    with connect() as conn:
+        current = conn.execute(
+            "SELECT id, tolerance_mm, changed_by, reason, changed_at FROM tolerance_revisions ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        revisions = conn.execute(
+            """SELECT id, tolerance_mm, changed_by, reason, changed_at
+               FROM tolerance_revisions ORDER BY id DESC LIMIT 10"""
+        ).fetchall()
+    return {"current": current, "revisions": revisions}
+
+
+@app.post("/api/tolerance", status_code=201)
+def update_tolerance(body: ToleranceIn, user: dict = Depends(require_writer)):
+    with connect() as conn:
+        row = conn.execute(
+            """INSERT INTO tolerance_revisions (tolerance_mm, changed_by, reason, changed_at)
+               VALUES (%s, %s, %s, now())
+               RETURNING id, tolerance_mm, changed_by, reason, changed_at""",
+            (body.tolerance_mm, user["username"], body.reason.strip()),
         ).fetchone()
         conn.commit()
     return row
